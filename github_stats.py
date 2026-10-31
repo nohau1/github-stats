@@ -1142,6 +1142,11 @@ def metric_help():
     return "available metrics: " + ", ".join(metrics)
 
 
+def cmd_serve(args):
+    import webui
+    return webui.serve(args.db, host=args.host, port=args.port, open_browser=not args.no_open)
+
+
 def cmd_token(args):
     path = args.token_file or default_token_path()
     token = getpass.getpass("GitHub token: ").strip()
@@ -1200,6 +1205,12 @@ def build_parser():
 
     token = sub.add_parser("token", help="save a GitHub token to the local token file")
     token.set_defaults(func=cmd_token)
+
+    serve = sub.add_parser("serve", help="start the local web dashboard")
+    serve.add_argument("--host", default="127.0.0.1", help="bind address, default 127.0.0.1")
+    serve.add_argument("--port", type=int, default=8765, help="port, default 8765")
+    serve.add_argument("--no-open", action="store_true", help="do not open the browser")
+    serve.set_defaults(func=cmd_serve)
 
     return parser
 
