@@ -582,6 +582,14 @@ function fmtDay(s){
   if(isNaN(d)) return s;
   return d.toLocaleDateString("ru-RU", { day:"2-digit", month:"short" });
 }
+function fmtDateShort(s){
+  if(!s) return "—";
+  const d = new Date(s);
+  if(isNaN(d)) return s;
+  const opts = { day:"2-digit", month:"short" };
+  if(d.getFullYear() !== new Date().getFullYear()) opts.year = "numeric";
+  return d.toLocaleDateString("ru-RU", opts);
+}
 function fmtStamp(s){
   const d = new Date(s);
   if(isNaN(d)) return s;
@@ -618,19 +626,33 @@ function lineChart(labels, series, opts){
     return `<div class="empty" style="padding:30px">Нет данных за период</div>`;
   }
   const W = 820, H = opts.height || 250;
-  const P = { l: 44, r: 14, t: 14, b: 28 };
+  const hasRight = series.some(s => s.axis === "right");
+  const P = { l: 44, r: hasRight ? 48 : 14, t: 14, b: 28 };
   const iw = W - P.l - P.r, ih = H - P.t - P.b;
-  const max = Math.max(1, ...series.flatMap(s => s.values));
+  const leftMax = Math.max(1, ...series.filter(s => s.axis !== "right").flatMap(s => s.values));
+  const rightMax = Math.max(1, ...series.filter(s => s.axis === "right").flatMap(s => s.values));
+  const scaleOf = s => s.axis === "right" ? rightMax : leftMax;
   const x = i => labels.length <= 1 ? P.l + iw/2 : P.l + i*(iw/(labels.length-1));
-  const y = v => P.t + ih - (v/max)*ih;
-  const labelText = s => opts.time ? fmtStamp(s) : fmtDay(s);
+  const y = (s, v) => P.t + ih - (v/scaleOf(s))*ih;
+  const spanMs = labels.length > 1 ? (new Date(labels[labels.length-1]) - new Date(labels[0])) : 0;
+  const useTime = opts.time && labels.length > 1 && spanMs < 86400000;
+  const labelText = s => useTime ? fmtStamp(s) : fmtDay(s);
   let g = "";
-  const ticks = Math.max(1, Math.min(4, Math.round(max)));
-  for(let k=0; k<=ticks; k++){
-    const gy = P.t + ih*k/ticks;
-    const val = max*(1 - k/ticks);
+  const leftTicks = Math.max(1, Math.min(4, Math.round(leftMax)));
+  for(let k=0; k<=leftTicks; k++){
+    const gy = P.t + ih*k/leftTicks;
+    const val = leftMax*(1 - k/leftTicks);
     g += `<line x1="${P.l}" y1="${gy}" x2="${W-P.r}" y2="${gy}" stroke="#232b3b" stroke-dasharray="3 4" stroke-width="1"/>`;
     g += `<text x="${P.l-8}" y="${gy+3.5}" text-anchor="end">${fmtTick(val)}</text>`;
+  }
+  if(hasRight){
+    const rc = series.find(s => s.axis === "right").color;
+    const rightTicks = Math.max(1, Math.min(4, Math.round(rightMax)));
+    for(let k=0; k<=rightTicks; k++){
+      const gy = P.t + ih*k/rightTicks;
+      const val = rightMax*(1 - k/rightTicks);
+      g += `<text x="${W-P.r+8}" y="${gy+3.5}" text-anchor="start" fill="${rc}" opacity="0.85">${fmtTick(val)}</text>`;
+    }
   }
   const xt = [];
   let idxs;
@@ -645,15 +667,15 @@ function lineChart(labels, series, opts){
   });
   let paths = "";
   series.forEach(s => {
-    const pts = s.values.map((v,i) => `${x(i).toFixed(1)},${y(v).toFixed(1)}`);
+    const pts = s.values.map((v,i) => `${x(i).toFixed(1)},${y(s,v).toFixed(1)}`);
     const area = `M ${x(0)},${P.t+ih} L ${pts.join(" L ")} L ${x(s.values.length-1)},${P.t+ih} Z`;
     paths += `<path d="${area}" fill="${s.color}" opacity="0.07"/>`;
     paths += `<polyline points="${pts.join(" ")}" fill="none" stroke="${s.color}" stroke-width="2.2" stroke-linejoin="round" stroke-linecap="round"/>`;
     s.values.forEach((v,i) => {
-      paths += `<circle cx="${x(i).toFixed(1)}" cy="${y(v).toFixed(1)}" r="2.6" fill="${s.color}"><title>${esc(labels[i])}: ${fmt(v)}</title></circle>`;
+      paths += `<circle cx="${x(i).toFixed(1)}" cy="${y(s,v).toFixed(1)}" r="2.6" fill="${s.color}"><title>${esc(labels[i])}: ${fmt(v)}</title></circle>`;
     });
   });
-  const legend = series.map(s => `<span><i style="background:${s.color}"></i>${esc(s.name)}</span>`).join("");
+  const legend = series.map(s => `<span><i style="background:${s.color}"></i>${esc(s.name)}${s.axis === "right" ? " <span class='dim'>(правая ось)</span>" : ""}</span>`).join("");
   return `<svg viewBox="0 0 ${W} ${H}" role="img">${g}${xt.join("")}${paths}</svg><div class="legend">${legend}</div>`;
 }
 
@@ -788,7 +810,7 @@ function renderRepoTable(){
       <td class="num">${fmt(r.cloners)}</td>
       <td class="num">${fmt(r.downloads)}</td>
       <td>${esc(r.language || "—")}</td>
-      <td class="dim">${esc(fmtDate(r.pushed_at))}</td>
+      <td class="dim">${esc(fmtDateShort(r.pushed_at))}</td>
     </tr>`;
   }).join("");
   const table = document.getElementById("repoTable");
@@ -898,7 +920,7 @@ async function loadRepo(id){
     const color = mode === "views" ? COLORS.accent : COLORS.green;
     document.getElementById("trafficChart").innerHTML = lineChart(labels, [
       { name: mode === "views" ? "Просмотры" : "Клоны", values: counts, color },
-      { name: mode === "views" ? "Уникальные посетители" : "Уникальные клонеры", values: uniques, color: COLORS.blue }
+      { name: mode === "views" ? "Уникальные посетители" : "Уникальные клонеры", values: uniques, color: COLORS.blue, axis: "right" }
     ], { height: 260 });
   };
   drawTraffic();
@@ -914,7 +936,7 @@ async function loadRepo(id){
       snaps.map(s => s.ts),
       [
         { name:"Звёзды", values: snaps.map(s => s.stars), color: COLORS.amber },
-        { name:"Форки", values: snaps.map(s => s.forks), color: COLORS.blue }
+        { name:"Форки", values: snaps.map(s => s.forks), color: COLORS.blue, axis: "right" }
       ],
       { height: 220, time: true }
     );
