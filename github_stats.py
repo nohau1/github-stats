@@ -91,6 +91,15 @@ CREATE TABLE IF NOT EXISTS traffic_paths(
   uniques INTEGER NOT NULL DEFAULT 0,
   PRIMARY KEY(repo_id, run_id, path)
 );
+CREATE TABLE IF NOT EXISTS traffic_totals(
+  repo_id INTEGER NOT NULL,
+  run_id INTEGER NOT NULL,
+  kind TEXT NOT NULL,
+  count INTEGER NOT NULL DEFAULT 0,
+  uniques INTEGER NOT NULL DEFAULT 0,
+  window_days INTEGER NOT NULL DEFAULT 14,
+  PRIMARY KEY(run_id, repo_id, kind)
+);
 CREATE TABLE IF NOT EXISTS releases(
   id INTEGER PRIMARY KEY,
   repo_id INTEGER NOT NULL,
@@ -187,7 +196,7 @@ class GitHub:
             headers["Authorization"] = f"Bearer {self.token}"
         return headers
 
-    def get(self, path, params=None, retries=2):
+    def get(self, path, params=None, retries=2, retry_404=0, soft_404=False):
         url = API + path
         if params:
             url += "?" + urllib.parse.urlencode(params)
@@ -204,6 +213,12 @@ class GitHub:
                 headers = dict(err.headers)
                 if status == 202:
                     return 202, None, headers
+                if status == 404 and retry_404 > 0 and attempt < retries:
+                    retry_404 -= 1
+                    time.sleep(3)
+                    continue
+                if status == 404 and soft_404:
+                    return 404, None, headers
                 if status in (403, 429) and attempt < retries:
                     retry_after = headers.get("Retry-After")
                     if retry_after:
@@ -392,8 +407,14 @@ def collect_repo(gh, db, run_id, repo, warnings):
 
     if gh.token:
         try:
-            status, views, _ = gh.get(f"/repos/{full}/traffic/views", {"per": "day"})
-            if status == 200 and views:
+            status, views, _ = gh.get(f"/repos/{full}/traffic/views", {"per": "day"}, retry_404=1, soft_404=True)
+            if status == 200:
+                views = views or {}
+                db.execute(
+                    """INSERT OR REPLACE INTO traffic_totals(repo_id, run_id, kind, count, uniques, window_days)
+                       VALUES (?,?,?,?,?,14)""",
+                    (repo_id, run_id, "views", views.get("count", 0), views.get("uniques", 0)),
+                )
                 for item in views.get("views") or []:
                     day = (item.get("timestamp") or "")[:10]
                     if day:
@@ -405,8 +426,14 @@ def collect_repo(gh, db, run_id, repo, warnings):
         except RuntimeError as err:
             warnings.append(f"{full}: traffic/views: {err}")
         try:
-            status, clones, _ = gh.get(f"/repos/{full}/traffic/clones", {"per": "day"})
-            if status == 200 and clones:
+            status, clones, _ = gh.get(f"/repos/{full}/traffic/clones", {"per": "day"}, retry_404=1, soft_404=True)
+            if status == 200:
+                clones = clones or {}
+                db.execute(
+                    """INSERT OR REPLACE INTO traffic_totals(repo_id, run_id, kind, count, uniques, window_days)
+                       VALUES (?,?,?,?,?,14)""",
+                    (repo_id, run_id, "clones", clones.get("count", 0), clones.get("uniques", 0)),
+                )
                 for item in clones.get("clones") or []:
                     day = (item.get("timestamp") or "")[:10]
                     if day:
@@ -418,7 +445,7 @@ def collect_repo(gh, db, run_id, repo, warnings):
         except RuntimeError as err:
             warnings.append(f"{full}: traffic/clones: {err}")
         try:
-            status, referrers, _ = gh.get(f"/repos/{full}/traffic/referrers")
+            status, referrers, _ = gh.get(f"/repos/{full}/traffic/popular/referrers", retry_404=1, soft_404=True)
             if status == 200 and referrers:
                 for item in referrers:
                     db.execute(
@@ -429,7 +456,7 @@ def collect_repo(gh, db, run_id, repo, warnings):
         except RuntimeError as err:
             warnings.append(f"{full}: traffic/referrers: {err}")
         try:
-            status, paths, _ = gh.get(f"/repos/{full}/traffic/popular/paths")
+            status, paths, _ = gh.get(f"/repos/{full}/traffic/popular/paths", retry_404=1, soft_404=True)
             if status == 200 and paths:
                 for item in paths:
                     db.execute(
@@ -680,7 +707,12 @@ SNAPSHOT_METRICS = {
     "downloads": "total_downloads",
 }
 
-TRAFFIC_METRICS = {"views": "traffic_views", "clones": "traffic_clones"}
+TRAFFIC_METRICS = {
+    "views": ("traffic_views", "count"),
+    "visitors": ("traffic_views", "uniques"),
+    "clones": ("traffic_clones", "count"),
+    "cloners": ("traffic_clones", "uniques"),
+}
 
 
 def resolve_repo(db, pattern):
@@ -732,6 +764,17 @@ def cmd_report(args):
                WHERE repo_id=? AND date >= date('now','-13 day')""",
             (rid,),
         ).fetchone()
+        totals = {}
+        for kind, count, uniques in db.execute(
+            """SELECT kind, count, uniques FROM traffic_totals
+               WHERE repo_id=? ORDER BY run_id DESC""",
+            (rid,),
+        ):
+            totals.setdefault(kind, (count, uniques))
+        if "views" in totals:
+            views = totals["views"]
+        if "clones" in totals:
+            clones = totals["clones"]
         rows.append(
             {
                 "repo": full_name + (" (private)" if private else "") + (" (archived)" if archived else ""),
@@ -758,7 +801,9 @@ def cmd_report(args):
         "forks": lambda row: row["forks"] or 0,
         "issues": lambda row: row["issues"] or 0,
         "views": lambda row: row["views"] or 0,
+        "visitors": lambda row: row["views_u"] or 0,
         "clones": lambda row: row["clones"] or 0,
+        "cloners": lambda row: row["clones_u"] or 0,
         "downloads": lambda row: row["dl"] or 0,
         "pushed": lambda row: row["pushed"],
     }
@@ -795,7 +840,7 @@ def cmd_report(args):
     for row in table:
         print("  ".join(str(row[i]).ljust(widths[i]) for i in range(len(header))))
     print()
-    print("delta vs previous run; VIEWS14/CLONES14 = last 14 days (uniques in parentheses); DL = release asset downloads")
+    print("delta vs previous run; VIEWS14/CLONES14 = last 14 days (unique visitors/cloners in parentheses); DL = release asset downloads")
     return 0
 
 
@@ -835,7 +880,7 @@ def cmd_history(args):
     ).fetchall()
     if traffic:
         print()
-        print("traffic (day, views, uniques, clones, uniques)")
+        print("traffic (day, views, unique, clones, unique)")
         for row in traffic:
             print(f"  {row[0]}  {row[1] or 0:>6}  {row[2] or 0:>6}  {row[3] or 0:>6}  {row[4] or 0:>6}")
 
@@ -863,6 +908,117 @@ def cmd_history(args):
     return 0
 
 
+def latest_traffic_totals(db, repo_id):
+    totals = {}
+    for kind, count, uniques, run_id in db.execute(
+        "SELECT kind, count, uniques, run_id FROM traffic_totals WHERE repo_id=? ORDER BY run_id DESC",
+        (repo_id,),
+    ):
+        totals.setdefault(kind, (count, uniques, run_id))
+    return totals
+
+
+def cmd_traffic(args):
+    db = connect(args.db)
+    found = resolve_repo(db, args.repo)
+    if not found:
+        return 1
+    repo_id, full_name = found
+    totals = latest_traffic_totals(db, repo_id)
+
+    rows = db.execute(
+        """SELECT d.date, v.count, v.uniques, c.count, c.uniques
+           FROM (SELECT DISTINCT date FROM traffic_views WHERE repo_id=?
+                 UNION SELECT DISTINCT date FROM traffic_clones WHERE repo_id=?) d
+           LEFT JOIN traffic_views v ON v.repo_id=? AND v.date=d.date
+           LEFT JOIN traffic_clones c ON c.repo_id=? AND c.date=d.date
+           ORDER BY d.date DESC LIMIT ?""",
+        (repo_id, repo_id, repo_id, repo_id, args.days),
+    ).fetchall()
+    rows.reverse()
+
+    print(full_name)
+    period = f"last {args.days} days"
+    if rows:
+        period += f" ({rows[0][0]} .. {rows[-1][0]})"
+    if totals:
+        run_id = next(iter(totals.values()))[2]
+        finished = db.execute("SELECT COALESCE(finished_at, started_at) FROM runs WHERE id=?", (run_id,)).fetchone()
+        if finished:
+            period += f", snapshot {finished[0]}"
+    print(f"traffic — {period}")
+    print()
+
+    labels = {
+        "clones": ("CLONES", "Clones", "Unique cloners"),
+        "views": ("VIEWS", "Views", "Unique visitors"),
+    }
+    for kind in ("clones", "views"):
+        if kind not in totals:
+            continue
+        count, uniques, _ = totals[kind]
+        title, total_label, unique_label = labels[kind]
+        print(title)
+        print(f"  {total_label:<18}{count:>8}")
+        print(f"  {unique_label:<18}{uniques:>8}")
+        print()
+
+    if not totals:
+        print("no period totals stored yet — run collect with a token")
+        views_sum = sum(row[1] or 0 for row in rows)
+        clones_sum = sum(row[3] or 0 for row in rows)
+        print(f"  daily sum fallback: {views_sum} views, {clones_sum} clones")
+        print()
+
+    if rows:
+        header = ["DATE", "VIEWS", "UNIQUE", "CLONES", "UNIQUE"]
+        table = [[row[0], row[1] or 0, row[2] or 0, row[3] or 0, row[4] or 0] for row in rows]
+        widths = [max(len(header[i]), *(len(str(r[i])) for r in table)) for i in range(len(header))]
+        print("DAILY")
+        print("  " + "  ".join(header[i].ljust(widths[i]) for i in range(len(header))))
+        print("  " + "  ".join("-" * widths[i] for i in range(len(header))))
+        for row in table:
+            print("  " + "  ".join(str(row[i]).ljust(widths[i]) for i in range(len(header))))
+        print()
+
+    ref_run = db.execute(
+        "SELECT MAX(run_id) FROM traffic_referrers WHERE repo_id=?", (repo_id,)
+    ).fetchone()[0]
+    if ref_run:
+        refs = db.execute(
+            """SELECT referrer, count, uniques FROM traffic_referrers
+               WHERE repo_id=? AND run_id=? ORDER BY count DESC, uniques DESC""",
+            (repo_id, ref_run),
+        ).fetchall()
+        if refs:
+            print("REFERRING SITES")
+            width = max(len(ref) for ref, _, _ in refs)
+            print(f"  {'VIEWS':>6}  {'UNIQUE':>6}  {'SITE':<{width}}")
+            for ref, count, uniques in refs:
+                print(f"  {count:>6}  {uniques:>6}  {ref:<{width}}")
+            print()
+
+    path_run = db.execute(
+        "SELECT MAX(run_id) FROM traffic_paths WHERE repo_id=?", (repo_id,)
+    ).fetchone()[0]
+    if path_run:
+        paths = db.execute(
+            """SELECT path, title, count, uniques FROM traffic_paths
+               WHERE repo_id=? AND run_id=? ORDER BY count DESC, uniques DESC""",
+            (repo_id, path_run),
+        ).fetchall()
+        if paths:
+            print("POPULAR CONTENT")
+            labels = [f"{title}  {path}" if title else path for path, title, _, _ in paths]
+            width = max(len(label) for label in labels)
+            print(f"  {'VIEWS':>6}  {'UNIQUE':>6}  {'CONTENT':<{width}}")
+            for label, (_, _, count, uniques) in zip(labels, paths):
+                print(f"  {count:>6}  {uniques:>6}  {label:<{width}}")
+            print()
+
+    return 0
+
+
 def cmd_chart(args):
     db = connect(args.db)
     found = resolve_repo(db, args.repo)
@@ -876,13 +1032,17 @@ def cmd_chart(args):
     window = f"-{max(args.days - 1, 0)} day"
 
     if metric in TRAFFIC_METRICS:
-        query = f"SELECT date, count FROM {TRAFFIC_METRICS[metric]} WHERE repo_id=?"
+        table, column = TRAFFIC_METRICS[metric]
+        query = f"SELECT date, {column} FROM {table} WHERE repo_id=?"
         params = [repo_id]
         if args.days:
-            query += " AND date >= date('now', ?)"
-            params.append(window)
-        query += " ORDER BY date"
+            query += " ORDER BY date DESC LIMIT ?"
+            params.append(args.days)
+        else:
+            query += " ORDER BY date"
         points = [(row[0], row[1] or 0) for row in db.execute(query, params)]
+        if args.days:
+            points.reverse()
     elif metric == "commits":
         query = "SELECT week, total FROM commit_activity WHERE repo_id=?"
         params = [repo_id]
@@ -925,11 +1085,23 @@ def cmd_top(args):
     db = connect(args.db)
     metric = args.metric
 
-    if metric in TRAFFIC_METRICS:
+    if metric in ("visitors", "cloners"):
+        kind = "views" if metric == "visitors" else "clones"
+        data = db.execute(
+            """SELECT r.full_name, t.uniques FROM repos r
+               JOIN traffic_totals t ON t.repo_id=r.id AND t.kind=?
+               WHERE t.run_id=(SELECT MAX(t2.run_id) FROM traffic_totals t2
+                               WHERE t2.repo_id=r.id AND t2.kind=?)
+               ORDER BY t.uniques DESC""",
+            (kind, kind),
+        ).fetchall()
+        title = f"{metric.upper()} (last 14 days, unique)"
+    elif metric in TRAFFIC_METRICS:
+        table, column = TRAFFIC_METRICS[metric]
         days = args.days or 14
         data = db.execute(
-            f"""SELECT r.full_name, COALESCE(SUM(t.count), 0) FROM repos r
-                LEFT JOIN {TRAFFIC_METRICS[metric]} t ON t.repo_id=r.id AND t.date >= date('now', ?)
+            f"""SELECT r.full_name, COALESCE(SUM(t.{column}), 0) FROM repos r
+                LEFT JOIN {table} t ON t.repo_id=r.id AND t.date >= date('now', ?)
                 GROUP BY r.id ORDER BY 2 DESC""",
             (f"-{max(days - 1, 0)} day",),
         ).fetchall()
@@ -1008,6 +1180,11 @@ def build_parser():
     history.add_argument("repo", help="repo name or owner/name (substring match)")
     history.add_argument("--days", type=int, default=30, help="traffic days to show, default 30")
     history.set_defaults(func=cmd_history)
+
+    traffic = sub.add_parser("traffic", help="show all GitHub traffic metrics for one repository")
+    traffic.add_argument("repo", help="repo name or owner/name (substring match)")
+    traffic.add_argument("--days", type=int, default=14, help="traffic days to show, default 14")
+    traffic.set_defaults(func=cmd_traffic)
 
     chart = sub.add_parser("chart", help="plot a metric history for one repository as a terminal chart")
     chart.add_argument("repo", help="repo name or owner/name (substring match)")
